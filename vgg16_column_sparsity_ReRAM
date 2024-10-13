@@ -1,0 +1,293 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from torchvision.models import vgg16, VGG16_Weights
+import os
+
+# 1. VGG-16 모델 로드
+def load_fp32_vgg16():
+    """
+    최신 PyTorch API를 사용하여 사전 학습된 VGG-16 모델을 로드합니다.
+    """
+    model = vgg16(weights=VGG16_Weights.DEFAULT)
+    model.eval()  # 평가 모드로 설정
+    return model
+
+# 2. 모델 가중치를 -127 ~ +127 범위의 INT8로 양자화
+def quantize_to_int8(model):
+    """
+    모델의 FP32 가중치를 INT8로 양자화하여 -127 ~ +127 범위로 제한합니다.
+    양자화된 가중치와 스케일 팩터는 딕셔너리로 반환됩니다.
+    """
+    quantized_weights = {}
+
+    for name, param in model.named_parameters():
+        # 가중치만 처리 (편향은 제외)
+        if 'weight' not in name:
+            continue  # 편향 또는 다른 매개변수는 건너뜁니다.
+
+        # FP32 가중치를 NumPy 배열로 변환
+        weights = param.data.cpu().numpy()
+
+        # 최대 절댓값에 따른 스케일링 팩터 계산
+        max_val = np.max(np.abs(weights))
+        scale = 127 / max_val if max_val != 0 else 1  # 0으로 나누는 것 방지
+
+        # 가중치를 -127 ~ +127 범위의 INT8로 양자화
+        weights_int8 = np.round(weights * scale).astype(np.int8)
+        weights_int8 = np.clip(weights_int8, -127, 127)  # 가중치가 -127 ~ +127 범위 내에 있는지 확인
+
+        # 양자화된 가중치와 스케일 팩터 저장
+        quantized_weights[name] = {'weights': weights_int8, 'scale': scale}
+
+    return quantized_weights
+
+# 3. RRAM 매핑 및 ADC 해상도 계산 (20번 반복)
+def analyze_rram_adc_resolution(weights_int8, layer_name, output_dir, num_iterations=20):
+    """
+    주어진 INT8 가중치를 RRAM 배열에 매핑하고, 각 컬럼의 합을 계산하여
+    양수와 음수에 대해 각각의 ADC 해상도를 결정합니다.
+    이 과정을 num_iterations 번 반복하여 평균 ADC 비트 수를 계산합니다.
+
+    Args:
+        weights_int8 (np.ndarray): 양자화된 INT8 가중치.
+        layer_name (str): 레이어 이름.
+        output_dir (str): 그래프 저장 디렉토리.
+        num_iterations (int): 반복 횟수.
+
+    Returns:
+        dict: 각 컬럼별 양수와 음수의 평균 ADC 비트 수.
+    """
+    weights_flat = weights_int8.flatten()
+    total_weights = len(weights_flat)
+
+    # 가중치 수가 충분한지 확인 (256개 이상)
+    if total_weights < 256:
+        print(f"Layer {layer_name}에는 최소 256개의 가중치가 필요합니다. 현재 가중치 수: {total_weights}")
+        return None
+
+    # 컬럼별 ADC 비트 수 누적을 위한 딕셔너리 초기화
+    accumulated_bits_needed = {
+        'Column 1_pos': 0, 'Column 1_neg': 0,
+        'Column 2_pos': 0, 'Column 2_neg': 0,
+        'Column 3_pos': 0, 'Column 3_neg': 0,
+        'Column 4_pos': 0, 'Column 4_neg': 0
+    }
+
+    for iteration in range(num_iterations):
+        # 256개의 가중치 랜덤 선택
+        np.random.seed(iteration)  # 각 반복마다 다른 시드 사용
+        selected_indices = np.random.choice(total_weights, 256, replace=False)
+        selected_weights = weights_flat[selected_indices]
+
+        # 양수와 음수 부분을 분리하여 각각 배열 생성
+        weights_pos = np.where(selected_weights >= 0, selected_weights, 0)
+        weights_neg = np.where(selected_weights < 0, -selected_weights, 0)
+
+        # 각 컬럼별로 양수와 음수의 비트 합산 값을 저장할 딕셔너리
+        sum_columns_pos = {'Column 1_pos': 0, 'Column 2_pos': 0, 'Column 3_pos': 0, 'Column 4_pos': 0}
+        sum_columns_neg = {'Column 1_neg': 0, 'Column 2_neg': 0, 'Column 3_neg': 0, 'Column 4_neg': 0}
+
+        # 각 가중치에 대해 비트 추출 및 컬럼별 합산
+        for idx in range(256):
+            # 양수 부분 처리
+            weight = int(weights_pos[idx])
+            bits = np.unpackbits(np.array([weight], dtype=np.uint8))
+
+            for i in range(4):
+                bit_pair = bits[i*2:(i*2)+2]
+                bit_value = bit_pair[0]*2 + bit_pair[1]  # 2비트 값 (0~3)
+                sum_columns_pos[f'Column {i+1}_pos'] += bit_value
+
+            # 음수 부분 처리
+            weight = int(weights_neg[idx])
+            bits = np.unpackbits(np.array([weight], dtype=np.uint8))
+
+            for i in range(4):
+                bit_pair = bits[i*2:(i*2)+2]
+                bit_value = bit_pair[0]*2 + bit_pair[1]  # 2비트 값 (0~3)
+                sum_columns_neg[f'Column {i+1}_neg'] += bit_value
+
+        # 각 컬럼별 양수와 음수 합산 값에 대해 ADC 비트 수 결정
+        for i in range(1, 5):
+            col_name_pos = f'Column {i}_pos'
+            col_name_neg = f'Column {i}_neg'
+
+            sum_pos = sum_columns_pos[col_name_pos]
+            sum_neg = sum_columns_neg[col_name_neg]
+
+            # ADC 비트 수 계산 (부호 비트 포함하지 않음)
+            bits_needed_pos = int(np.ceil(np.log2(sum_pos + 1))) if sum_pos > 0 else 1
+            bits_needed_neg = int(np.ceil(np.log2(sum_neg + 1))) if sum_neg > 0 else 1
+
+            accumulated_bits_needed[col_name_pos] += bits_needed_pos
+            accumulated_bits_needed[col_name_neg] += bits_needed_neg
+
+    # 평균 ADC 비트 수 계산
+    avg_bits_needed_columns = {col: accumulated_bits_needed[col] / num_iterations for col in accumulated_bits_needed}
+
+    # 그래프 저장 디렉토리 생성
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # 컬럼별 평균 ADC 해상도 플롯
+    columns = ['Column 1_pos', 'Column 1_neg', 'Column 2_pos', 'Column 2_neg',
+               'Column 3_pos', 'Column 3_neg', 'Column 4_pos', 'Column 4_neg']
+    bits = [avg_bits_needed_columns[col] for col in columns]
+
+    plt.figure(figsize=(16, 6))
+    plt.bar(columns, bits, color=['green', 'red']*4, edgecolor='black')
+    plt.xlabel('Column')
+    plt.ylabel('Average ADC Bits Needed')
+    plt.title(f'Average ADC Bits Needed per Column (Pos & Neg)\nLayer: {layer_name}')
+    plt.ylim(0, int(max(bits)) + 2)
+    plt.grid(axis='y')
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(range(0, int(max(bits)) + 3, 1))
+
+    # 바(bar) 위에 평균 ADC 비트 수 표시
+    for i, bit in enumerate(bits):
+        plt.text(i, bit + 0.1, f"{bit:.2f}", ha='center', va='bottom', fontsize=10)
+
+    plt.tight_layout()
+
+    # 그래프 저장
+    filename = f"{layer_name}_average_adc_resolution.png"
+    filepath = os.path.join(output_dir, filename)
+    plt.savefig(filepath)
+    plt.close()
+    print(f"Saved average ADC resolution plot for layer {layer_name} at {filepath}")
+    for col, bit in zip(columns, bits):
+        print(f"Layer {layer_name} - {col}: Average ADC bits needed = {bit:.2f}")
+
+    # 반환값
+    return {
+        'avg_bits_needed_columns': avg_bits_needed_columns
+    }
+
+# 4. 전체 레이어에 걸쳐 컬럼당 평균 ADC 해상도 계산 및 플롯
+def plot_average_adc_bits_per_column_all_layers(layers_data, output_dir):
+    """
+    전체 레이어에 걸쳐 각 컬럼별로 필요한 평균 ADC 해상도의 평균을 계산하고 플롯합니다.
+    """
+    columns = ['Column 1_pos', 'Column 1_neg', 'Column 2_pos', 'Column 2_neg',
+               'Column 3_pos', 'Column 3_neg', 'Column 4_pos', 'Column 4_neg']
+    total_bits_per_column = {col: 0 for col in columns}
+    num_layers = len(layers_data)
+
+    for data in layers_data:
+        for col in columns:
+            total_bits_per_column[col] += data['avg_bits_needed_columns'][col]
+
+    avg_bits_per_column = {col: total_bits_per_column[col] / num_layers for col in columns}
+
+    # 데이터를 리스트로 변환
+    avg_bits = [avg_bits_per_column[col] for col in columns]
+
+    plt.figure(figsize=(16, 6))
+    plt.bar(columns, avg_bits, color=['green', 'red']*4, edgecolor='black')
+    plt.xlabel('Column')
+    plt.ylabel('Average ADC Bits Needed Across All Layers')
+    plt.title('Average ADC Bits Needed per Column Across All Layers')
+    plt.ylim(0, int(max(avg_bits)) + 2)
+    plt.grid(axis='y')
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(range(0, int(max(avg_bits)) + 3, 1))
+
+    # 바(bar) 위에 평균 ADC 비트 수 표시
+    for i, bits in enumerate(avg_bits):
+        plt.text(i, bits + 0.1, f'{bits:.2f}',
+                 ha='center', va='bottom', fontsize=10)
+
+    plt.tight_layout()
+
+    # 그래프 저장 디렉토리 생성
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # 그래프 저장
+    filename = f"average_adc_bits_per_column_all_layers.png"
+    filepath = os.path.join(output_dir, filename)
+    plt.savefig(filepath)
+    plt.close()
+
+    print(f"Saved average ADC bits needed per column across all layers plot: {filepath}")
+
+# 5. 메인 함수
+def main():
+    # 재현성을 위해 랜덤 시드 설정
+    np.random.seed(42)
+
+    # 그래프 저장 디렉토리 정의
+    output_dir = "bit_sparsity_plots"
+
+    # VGG-16 모델 로드
+    model = load_fp32_vgg16()
+    print("Loaded VGG-16 model with FP32 weights.")
+
+    # 모델 가중치를 INT8로 양자화
+    quantized_weights = quantize_to_int8(model)
+    print("Quantized model weights to INT8 within -127 to +127.")
+
+    # 양자화된 가중치 키 출력
+    print("\nQuantized Weights Keys:")
+    for key in quantized_weights.keys():
+        print(f" - {key}")
+
+    # 레이어별 데이터를 저장할 리스트
+    layers_data = []
+
+    # 각 컨볼루션 레이어에 대해 처리
+    for name, layer in model.named_modules():
+        if isinstance(layer, torch.nn.Conv2d):
+            print(f"\nProcessing layer: {name}")
+
+            # 해당 레이어의 가중치 이름 정의
+            weight_param_name = f"{name}.weight"
+
+            if weight_param_name not in quantized_weights:
+                print(f"No quantized weights found for layer: {name}")
+                continue
+
+            # 양자화된 INT8 가중치 추출
+            weights_int8 = quantized_weights[weight_param_name]['weights']
+            print(f"Total weights: {weights_int8.size}")
+
+            # 가중치 크기 확인 (256개 이상인지)
+            if weights_int8.size < 256:
+                print(f"Layer {name} skipped due to insufficient weights.")
+                continue
+
+            # RRAM 매핑 및 ADC 해상도 분석 (20번 반복)
+            adc_resolution_info = analyze_rram_adc_resolution(weights_int8, name, output_dir, num_iterations=20)
+
+            if adc_resolution_info is not None:
+                # avg_bits_needed_columns에는 8개의 컬럼별 평균 비트 수가 저장됨
+                avg_bits_needed_columns = adc_resolution_info['avg_bits_needed_columns']
+
+                # 각 레이어의 평균 비트 수 계산
+                avg_bits_needed = np.mean(list(avg_bits_needed_columns.values()))
+                max_bits_needed = np.max(list(avg_bits_needed_columns.values()))
+
+                print(f"Weights sum needs on average {avg_bits_needed:.2f} bits to represent")
+                print(f"Maximum bits needed in weights sum: {max_bits_needed:.2f} bits")
+
+                # 데이터 저장
+                layer_data = {
+                    'name': name,
+                    'avg_bits_needed': avg_bits_needed,
+                    'max_bits_needed': max_bits_needed,
+                    'avg_bits_needed_columns': avg_bits_needed_columns
+                }
+                layers_data.append(layer_data)
+            else:
+                print(f"Skipped layer: {name} due to insufficient weights.")
+
+    # 전체 레이어에 걸쳐 컬럼당 평균 ADC 해상도 플롯 생성
+    if len(layers_data) > 0:
+        plot_average_adc_bits_per_column_all_layers(layers_data, output_dir)
+    else:
+        print("No layers data to plot.")
+
+if __name__ == "__main__":
+    main()
